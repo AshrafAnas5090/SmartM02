@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Smart Money Analyzer Pro - V22.4-QUOTA-PRO</title>
+<title>Smart Money Analyzer Pro - V23.0-MICROSTRUCTURE</title>
 <style>
 :root {
   --bg: #070b10;
@@ -149,6 +149,32 @@ tr:hover td { background: rgba(255,255,255,0.02); }
 .actions-cell { display: flex; gap: 4px; justify-content: center; }
 .row-btn { padding: 3px 6px; font-size: 10px; border-radius: 4px; border: 1px solid var(--border); background: rgba(255,255,255,0.02); color: var(--muted); transition: all 0.2s; }
 .row-btn:hover { border-color: var(--red); color: var(--red); }
+
+/* V23.0 — Microstructure retrieval identity */
+.record-title-block{display:flex;flex-direction:column;gap:7px;min-width:0;flex:1;}
+.market-strip{display:flex;align-items:center;gap:6px;flex-wrap:wrap;min-height:24px;}
+.feed-badge{
+  display:inline-flex;align-items:center;gap:5px;padding:4px 8px;border-radius:999px;
+  font-family:'Consolas','Menlo',monospace;font-size:9px;font-weight:900;letter-spacing:.35px;
+  border:1px solid var(--border);background:rgba(255,255,255,.025);color:var(--muted);
+  white-space:nowrap;box-shadow:inset 0 0 0 1px rgba(255,255,255,.01);
+}
+.feed-badge.ok{color:#82f7ba;border-color:rgba(0,230,118,.28);background:rgba(0,230,118,.07);box-shadow:0 0 14px rgba(0,230,118,.05);}
+.feed-badge.warn{color:#ffe18a;border-color:rgba(255,213,79,.28);background:rgba(255,213,79,.06);}
+.feed-badge.err{color:#ffaaa5;border-color:rgba(255,82,82,.32);background:rgba(255,82,82,.07);}
+.feed-badge.purple{color:#dbc8ff;border-color:rgba(167,139,250,.32);background:rgba(167,139,250,.08);box-shadow:0 0 14px rgba(167,139,250,.05);}
+.feed-badge.pulse::before{content:'';width:6px;height:6px;border-radius:50%;background:currentColor;box-shadow:0 0 0 0 currentColor;animation:feedPulse 1.8s ease-out infinite;}
+@keyframes feedPulse{0%{box-shadow:0 0 0 0 rgba(0,230,118,.45)}70%{box-shadow:0 0 0 6px rgba(0,230,118,0)}100%{box-shadow:0 0 0 0 rgba(0,230,118,0)}}
+.row-data-badge{display:inline-block;padding:4px 7px;border-radius:6px;font-size:10px;font-weight:900;line-height:1.35;border:1px solid var(--border);background:rgba(255,255,255,.02);}
+.row-data-badge.ok{color:#82f7ba;border-color:rgba(0,230,118,.2);background:rgba(0,230,118,.04);}
+.row-data-badge.warn{color:#ffe18a;border-color:rgba(255,213,79,.2);background:rgba(255,213,79,.04);}
+.row-data-badge.purple{color:#dbc8ff;border-color:rgba(167,139,250,.22);background:rgba(167,139,250,.05);}
+.mini-detail{font-size:8px;font-weight:700;color:var(--muted);}
+.micro-head{color:#82f7ba!important;background:linear-gradient(180deg,rgba(0,230,118,.045),rgba(9,15,23,.95))!important;}
+.purple-text{color:#cdb7ff!important;background:linear-gradient(180deg,rgba(167,139,250,.05),rgba(9,15,23,.95))!important;}
+.logs-table{min-width:1900px!important;}
+@media(max-width:900px){.record-header{align-items:flex-start}.header-actions{width:100%}.feed-badge{font-size:8px}.market-strip{gap:4px}}
+
 </style>
 </head>
 <body>
@@ -156,9 +182,9 @@ tr:hover td { background: rgba(255,255,255,0.02); }
 <header class="top">
 <div class="brand">
   <div class="logo">SM</div>
-  <div><p class="sub">Binance Futures • Verified Exact Data Parser (V22.4-QUOTA-PRO)</p></div>
+  <div><p class="sub">Binance Futures • SmartMoney + Live Microstructure (V23.0)</p></div>
 </div>
-<div class="range">VERIFIED PARSER ACTIVE</div>
+<div class="range">VERIFIED DATA PIPELINE ACTIVE</div>
 </header>
 
 <section class="search">
@@ -172,330 +198,909 @@ tr:hover td { background: rgba(255,255,255,0.02); }
 
 <script>
 "use strict";
-const KEY="smart_money_v22_4_pro";
+
+/* ========================================================================
+   SMART MONEY ANALYZER PRO — V23.0 MICROSTRUCTURE
+   Architecture:
+   - localStorage: lightweight application state / summaries
+   - IndexedDB: full per-log market snapshots
+   - RAM/WebSocket: live top-20 order book + observed liquidation feed
+   ======================================================================== */
+const KEY="smart_money_v22_4_pro"; // keep the existing key for backward compatibility
+const DB_NAME="smart_money_market_v23";
+const DB_VERSION=1;
+const SNAPSHOT_STORE="snapshots";
 const SM="https://www.binance.com/bapi/futures/v1/public";
 const FUT="https://fapi.binance.com";
-let records=load();
-const DEFAULT_INTERVAL = 30 * 60;
-const coin=document.getElementById("coin"), search=document.getElementById("search"), status=document.getElementById("status"), recordsEl=document.getElementById("records");
+const WS_BASE="wss://fstream.binance.com/stream?streams=";
+const DEFAULT_INTERVAL=30*60;
+const LIQ_WINDOW_MS=30*60*1000;
+const ORDERBOOK_LEVELS=20;
+const LIVE_STALE_MS=5000;
 
+let records=load();
+const marketHubs=new Map();
+const snapshotCache=new Map();
+let dbPromise=null;
+
+const coin=document.getElementById("coin"),
+      search=document.getElementById("search"),
+      status=document.getElementById("status"),
+      recordsEl=document.getElementById("records");
+
+/* ------------------------------ STORAGE -------------------------------- */
 function load(){
   try{
     const x=JSON.parse(localStorage.getItem(KEY)||"[]");
-    const now = Math.floor(Date.now() / 1000);
+    const now=Math.floor(Date.now()/1000);
     return Array.isArray(x)?x.map(r=>({
       ...r,
-      intervalSec: r.intervalSec || DEFAULT_INTERVAL,
-      nextFetchTime: r.nextFetchTime || (now + (r.intervalSec || DEFAULT_INTERVAL)),
-      fetchedDone: r.fetchedDone || false
+      logs:(Array.isArray(r.logs)?r.logs:[]).map(log=>{
+        const vm=log?.viewModel?{...log.viewModel}:{};
+        // V22.4 fetched 5m candles but mislabeled candleMeta as 30m. Migrate that metadata safely.
+        const migratedVmMeta=vm.candleMeta?{...vm.candleMeta,interval:"5m"}:vm.candleMeta;
+        const migratedLogMeta=log?.candleMeta?{...log.candleMeta,interval:"5m"}:log?.candleMeta;
+        return{...log,viewModel:{...vm,candleMeta:migratedVmMeta},candleMeta:migratedLogMeta};
+      }),
+      intervalSec:r.intervalSec||DEFAULT_INTERVAL,
+      nextFetchTime:r.nextFetchTime||(now+(r.intervalSec||DEFAULT_INTERVAL)),
+      fetchedDone:Boolean(r.fetchedDone)
     })):[];
-  }catch{return[]}
+  }catch(e){
+    console.error("Local state load failed",e);
+    return[];
+  }
 }
-function save(){localStorage.setItem(KEY,JSON.stringify(records))}
+
+function save(){
+  try{
+    localStorage.setItem(KEY,JSON.stringify(records));
+  }catch(e){
+    console.error("Local state save failed",e);
+    setStatus("Local state save failed. Historical heavy snapshots remain in IndexedDB.","err");
+  }
+}
+
+function openMarketDB(){
+  if(dbPromise)return dbPromise;
+  dbPromise=new Promise((resolve,reject)=>{
+    if(!("indexedDB" in window)){
+      reject(new Error("IndexedDB is not supported by this browser"));
+      return;
+    }
+    const request=indexedDB.open(DB_NAME,DB_VERSION);
+    request.onupgradeneeded=()=>{
+      const db=request.result;
+      if(!db.objectStoreNames.contains(SNAPSHOT_STORE)){
+        const store=db.createObjectStore(SNAPSHOT_STORE,{keyPath:"id"});
+        store.createIndex("symbol","symbol",{unique:false});
+        store.createIndex("fetchedAt","fetchedAt",{unique:false});
+      }
+    };
+    request.onsuccess=()=>resolve(request.result);
+    request.onerror=()=>reject(request.error||new Error("IndexedDB open failed"));
+  });
+  return dbPromise;
+}
+
+async function putSnapshot(snapshot){
+  const db=await openMarketDB();
+  await new Promise((resolve,reject)=>{
+    const tx=db.transaction(SNAPSHOT_STORE,"readwrite");
+    tx.objectStore(SNAPSHOT_STORE).put(snapshot);
+    tx.oncomplete=()=>resolve();
+    tx.onerror=()=>reject(tx.error||new Error("Snapshot write failed"));
+    tx.onabort=()=>reject(tx.error||new Error("Snapshot write aborted"));
+  });
+  snapshotCache.set(snapshot.id,snapshot);
+  return snapshot.id;
+}
+
+async function getSnapshot(id){
+  if(!id)return null;
+  if(snapshotCache.has(id))return snapshotCache.get(id);
+  try{
+    const db=await openMarketDB();
+    const result=await new Promise((resolve,reject)=>{
+      const tx=db.transaction(SNAPSHOT_STORE,"readonly");
+      const req=tx.objectStore(SNAPSHOT_STORE).get(id);
+      req.onsuccess=()=>resolve(req.result||null);
+      req.onerror=()=>reject(req.error||new Error("Snapshot read failed"));
+    });
+    if(result)snapshotCache.set(id,result);
+    return result;
+  }catch(e){
+    console.error("Snapshot read failed",e);
+    return null;
+  }
+}
+
+async function deleteSnapshot(id){
+  if(!id)return;
+  snapshotCache.delete(id);
+  try{
+    const db=await openMarketDB();
+    await new Promise((resolve,reject)=>{
+      const tx=db.transaction(SNAPSHOT_STORE,"readwrite");
+      tx.objectStore(SNAPSHOT_STORE).delete(id);
+      tx.oncomplete=()=>resolve();
+      tx.onerror=()=>reject(tx.error||new Error("Snapshot delete failed"));
+    });
+  }catch(e){console.warn("Snapshot delete skipped",e)}
+}
+
+async function deleteSnapshotsForRecord(record){
+  if(!record?.logs)return;
+  await Promise.all(record.logs.map(log=>deleteSnapshot(log.marketSnapshotId)));
+}
+
+/* ------------------------------- HELPERS -------------------------------- */
 function setStatus(t,c=""){status.textContent=t;status.className="status"+(c?" "+c:"")}
 function sym(v){v=String(v||"").trim().toUpperCase();if(!v)return"";return v.endsWith("USDT")?v:v+"USDT"}
 function n(v){v=Number(v);return Number.isFinite(v)?v:0}
+function finite(v){return Number.isFinite(Number(v))}
 function compact(v){v=n(v);const a=Math.abs(v);if(a>=1e9)return(v/1e9).toFixed(2)+"B";if(a>=1e6)return(v/1e6).toFixed(2)+"M";if(a>=1e3)return(v/1e3).toFixed(2)+"K";return v.toFixed(2)}
 function price(v){v=n(v);if(v>=100)return v.toFixed(2);if(v>=1)return v.toFixed(4);if(v>=.01)return v.toFixed(6);return v.toFixed(8)}
 function pct(v){return n(v).toFixed(2)+"%"}
-
-async function req(url){const r=await fetch(url);if(!r.ok)throw new Error("HTTP "+r.status);return r.json()}
-
-async function fetchData(symbol){
-const urls=[
-SM+"/future/smart-money/signal/overview?symbol="+encodeURIComponent(symbol),
-SM+"/future/smart-money/signal/details/stats?symbol="+encodeURIComponent(symbol)+"&timeRange=30m",
-FUT+"/fapi/v1/ticker/price?symbol="+encodeURIComponent(symbol),
-FUT+"/fapi/v1/ticker/24hr?symbol="+encodeURIComponent(symbol),
-FUT+"/fapi/v1/openInterest?symbol="+encodeURIComponent(symbol),
-FUT+"/fapi/v1/premiumIndex?symbol="+encodeURIComponent(symbol),
-FUT+"/fapi/v1/klines?symbol="+encodeURIComponent(symbol)+"&interval=5m&limit=100"
-];
-const [overview,stats30,priceData,volume,oi,funding,candles]=await Promise.all(urls.map(req));
-if(!Array.isArray(candles))throw new Error("Candles response is not an array");
-const validCandles=candles.filter(c=>Array.isArray(c)&&c.length>=6&&Number.isFinite(Number(c[0]))&&Number.isFinite(Number(c[1]))&&Number.isFinite(Number(c[2]))&&Number.isFinite(Number(c[3]))&&Number.isFinite(Number(c[4]))&&Number.isFinite(Number(c[5])));
-const candleMeta={interval:"30m",requested:100,loaded:candles.length,valid:validCandles.length,firstTime:candles[0]?.[0]||null,lastTime:candles[candles.length-1]?.[0]||null,loadedOk:candles.length===100&&validCandles.length===100};
-const candleData=validCandles.map(c=>({time:Number(c[0]),open:Number(c[1]),high:Number(c[2]),low:Number(c[3]),close:Number(c[4]),volume:Number(c[5])}));
-return{symbol,overview,stats30,price:priceData,volume,openInterest:oi,funding,candles:candleData,candleMeta,fetchedAt:Date.now()}
+function nowIso(){return new Date().toISOString()}
+function snapshotId(symbol){return `${symbol}:${Date.now()}:${Math.random().toString(36).slice(2,10)}`}
+function escapeHtml(s){return String(s??"").replace(/[&<>'"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;","'":"&#39;",'"':"&quot;"}[c]))}
+function median(values){
+  const a=values.filter(Number.isFinite).sort((x,y)=>x-y);
+  if(!a.length)return 0;
+  const m=Math.floor(a.length/2);
+  return a.length%2?a[m]:(a[m-1]+a[m])/2;
 }
+function formatAge(ms){
+  if(!Number.isFinite(ms)||ms<0)return"--";
+  if(ms<1000)return`${Math.round(ms)}ms`;
+  if(ms<60000)return`${Math.round(ms/1000)}s`;
+  return`${Math.round(ms/60000)}m`;
+}
+async function req(url){
+  const r=await fetch(url,{cache:"no-store"});
+  if(!r.ok)throw new Error(`HTTP ${r.status} — ${url}`);
+  return r.json();
+}
+
+/* -------------------------- LIVE MARKET HUB ----------------------------- */
+function createHub(symbol){
+  return{
+    symbol,
+    socket:null,
+    reconnectTimer:null,
+    reconnectAttempts:0,
+    connected:false,
+    startedAt:Date.now(),
+    connectedAt:null,
+    lastWsAt:0,
+    lastError:"",
+    depth:null,
+    bookTicker:null,
+    liquidationEvents:[]
+  };
+}
+
+function ensureMarketStream(symbol){
+  let hub=marketHubs.get(symbol);
+  if(!hub){
+    hub=createHub(symbol);
+    marketHubs.set(symbol,hub);
+    connectMarketStream(hub);
+  }else if(!hub.socket && !hub.reconnectTimer){
+    connectMarketStream(hub);
+  }
+  return hub;
+}
+
+function connectMarketStream(hub){
+  if(!hub||hub.socket)return;
+  const lower=hub.symbol.toLowerCase();
+  const streams=[`${lower}@depth20@100ms`,`${lower}@bookTicker`,`${lower}@forceOrder`].join("/");
+  let socket;
+  try{socket=new WebSocket(WS_BASE+streams)}catch(e){scheduleReconnect(hub,e);return}
+  hub.socket=socket;
+
+  socket.onopen=()=>{
+    hub.connected=true;
+    hub.connectedAt=Date.now();
+    hub.reconnectAttempts=0;
+    hub.lastError="";
+    updateFeedBadges();
+  };
+
+  socket.onmessage=event=>{
+    hub.lastWsAt=Date.now();
+    try{
+      const packet=JSON.parse(event.data);
+      const data=packet?.data||packet;
+      if(!data)return;
+      if(data.e==="depthUpdate"){
+        hub.depth={
+          eventTime:n(data.E),
+          transactionTime:n(data.T),
+          firstUpdateId:n(data.U),
+          finalUpdateId:n(data.u),
+          previousFinalUpdateId:n(data.pu),
+          bids:Array.isArray(data.b)?data.b:[],
+          asks:Array.isArray(data.a)?data.a:[],
+          receivedAt:Date.now(),
+          source:"BINANCE_WS_PARTIAL_DEPTH_20_100MS"
+        };
+      }else if(data.e==="bookTicker"){
+        hub.bookTicker={
+          eventTime:n(data.E),
+          transactionTime:n(data.T),
+          updateId:n(data.u),
+          bestBid:n(data.b),
+          bestBidQty:n(data.B),
+          bestAsk:n(data.a),
+          bestAskQty:n(data.A),
+          receivedAt:Date.now(),
+          source:"BINANCE_WS_BOOK_TICKER"
+        };
+      }else if(data.e==="forceOrder"&&data.o){
+        const o=data.o;
+        const orderSide=String(o.S||"").toUpperCase();
+        const liquidationSide=orderSide==="SELL"?"LONG":orderSide==="BUY"?"SHORT":"UNKNOWN";
+        const eventPrice=n(o.ap)>0?n(o.ap):n(o.p);
+        const filledQty=n(o.z)>0?n(o.z):n(o.q);
+        const evt={
+          eventTime:n(data.E)||Date.now(),
+          transactionTime:n(o.T)||n(data.E)||Date.now(),
+          symbol:String(o.s||hub.symbol),
+          orderSide,
+          liquidationSide,
+          orderType:String(o.o||""),
+          timeInForce:String(o.f||""),
+          originalQty:n(o.q),
+          price:n(o.p),
+          averagePrice:n(o.ap),
+          lastFilledQty:n(o.l),
+          filledQty,
+          status:String(o.X||""),
+          observedPrice:eventPrice,
+          observedNotionalUSDT:eventPrice*filledQty,
+          receivedAt:Date.now()
+        };
+        hub.liquidationEvents.push(evt);
+        pruneLiquidations(hub);
+      }
+    }catch(e){console.warn("WS message parse failed",hub.symbol,e)}
+  };
+
+  socket.onerror=()=>{hub.lastError="WebSocket error"};
+  socket.onclose=()=>{
+    hub.connected=false;
+    hub.socket=null;
+    updateFeedBadges();
+    if(records.some(r=>r.symbol===hub.symbol))scheduleReconnect(hub);
+  };
+}
+
+function scheduleReconnect(hub,error){
+  if(!hub||hub.reconnectTimer)return;
+  hub.connected=false;
+  hub.socket=null;
+  hub.lastError=error?.message||hub.lastError||"Disconnected";
+  const delay=Math.min(30000,1000*Math.pow(2,Math.min(hub.reconnectAttempts,5)));
+  hub.reconnectAttempts++;
+  hub.reconnectTimer=setTimeout(()=>{
+    hub.reconnectTimer=null;
+    if(records.some(r=>r.symbol===hub.symbol))connectMarketStream(hub);
+  },delay);
+}
+
+function stopMarketStream(symbol){
+  const hub=marketHubs.get(symbol);
+  if(!hub)return;
+  if(hub.reconnectTimer)clearTimeout(hub.reconnectTimer);
+  hub.reconnectTimer=null;
+  try{if(hub.socket)hub.socket.close()}catch{}
+  hub.socket=null;
+  hub.connected=false;
+  marketHubs.delete(symbol);
+}
+
+function pruneLiquidations(hub){
+  const cutoff=Date.now()-LIQ_WINDOW_MS;
+  hub.liquidationEvents=hub.liquidationEvents.filter(e=>(e.eventTime||e.receivedAt)>=cutoff);
+}
+
+/* ---------------------- MICROSTRUCTURE ANALYTICS ------------------------ */
+function normalizeLevels(levels,side){
+  const out=(Array.isArray(levels)?levels:[])
+    .filter(x=>Array.isArray(x)&&x.length>=2&&finite(x[0])&&finite(x[1])&&n(x[0])>0&&n(x[1])>=0)
+    .map(x=>({price:n(x[0]),qty:n(x[1]),notionalUSDT:n(x[0])*n(x[1])}))
+    .filter(x=>x.qty>0);
+  out.sort((a,b)=>side==="bid"?b.price-a.price:a.price-b.price);
+  return out.slice(0,ORDERBOOK_LEVELS);
+}
+
+function wallCandidates(levels){
+  if(!levels.length)return[];
+  const med=median(levels.map(x=>x.notionalUSDT));
+  return[...levels]
+    .sort((a,b)=>b.notionalUSDT-a.notionalUSDT)
+    .slice(0,3)
+    .map(x=>({
+      ...x,
+      strengthVsMedian:med>0?x.notionalUSDT/med:0
+    }));
+}
+
+function analyzeOrderBook(raw,current,bookTicker=null){
+  const bids=normalizeLevels(raw?.bids||raw?.b||[],"bid");
+  const asks=normalizeLevels(raw?.asks||raw?.a||[],"ask");
+  const bestBid=bookTicker?.bestBid>0?bookTicker.bestBid:(bids[0]?.price||0);
+  const bestAsk=bookTicker?.bestAsk>0?bookTicker.bestAsk:(asks[0]?.price||0);
+  const midPrice=bestBid>0&&bestAsk>0?(bestBid+bestAsk)/2:n(current);
+  const spread=bestAsk>0&&bestBid>0?bestAsk-bestBid:0;
+  const spreadBps=midPrice>0?(spread/midPrice)*10000:0;
+  const bidDepthUSDT=bids.reduce((s,x)=>s+x.notionalUSDT,0);
+  const askDepthUSDT=asks.reduce((s,x)=>s+x.notionalUSDT,0);
+  const totalDepth=bidDepthUSDT+askDepthUSDT;
+  const imbalancePct=totalDepth>0?((bidDepthUSDT-askDepthUSDT)/totalDepth)*100:0;
+  const capturedAt=Date.now();
+  const dataOk=bids.length>=5&&asks.length>=5&&bestBid>0&&bestAsk>0;
+  const source=raw?.source||"BINANCE_REST_DEPTH";
+  return{
+    status:dataOk?"READY":"NOT_AVAILABLE",
+    source,
+    capturedAt,
+    eventTime:n(raw?.eventTime||raw?.E)||null,
+    transactionTime:n(raw?.transactionTime||raw?.T)||null,
+    updateId:n(raw?.finalUpdateId||raw?.lastUpdateId||raw?.u)||null,
+    levelsRequested:ORDERBOOK_LEVELS,
+    bidsLoaded:bids.length,
+    asksLoaded:asks.length,
+    bestBid,
+    bestAsk,
+    bestBidQty:bookTicker?.bestBidQty||bids[0]?.qty||0,
+    bestAskQty:bookTicker?.bestAskQty||asks[0]?.qty||0,
+    midPrice,
+    spread,
+    spreadBps,
+    bidDepthUSDT,
+    askDepthUSDT,
+    imbalancePct,
+    bidWalls:wallCandidates(bids),
+    askWalls:wallCandidates(asks),
+    bids,
+    asks,
+    bookTicker:bookTicker?{...bookTicker}:null
+  };
+}
+
+function clusterLiquidations(events,currentPrice,side){
+  const filtered=events.filter(e=>e.liquidationSide===side&&e.observedPrice>0&&e.observedNotionalUSDT>=0);
+  if(!filtered.length||currentPrice<=0)return[];
+  const bucketSize=Math.max(currentPrice*0.001,Number.EPSILON); // 0.10% price buckets, derived not predicted
+  const map=new Map();
+  for(const e of filtered){
+    const bucket=Math.round(e.observedPrice/bucketSize)*bucketSize;
+    const key=bucket.toFixed(12);
+    const c=map.get(key)||{side,price:bucket,eventCount:0,observedNotionalUSDT:0,qty:0,firstEventTime:e.eventTime,lastEventTime:e.eventTime};
+    c.eventCount++;
+    c.observedNotionalUSDT+=e.observedNotionalUSDT;
+    c.qty+=e.filledQty;
+    c.firstEventTime=Math.min(c.firstEventTime,e.eventTime);
+    c.lastEventTime=Math.max(c.lastEventTime,e.eventTime);
+    map.set(key,c);
+  }
+  return[...map.values()]
+    .map(c=>({...c,distancePct:currentPrice>0?((c.price-currentPrice)/currentPrice)*100:0}))
+    .sort((a,b)=>b.observedNotionalUSDT-a.observedNotionalUSDT);
+}
+
+function analyzeLiquidations(hub,currentPrice){
+  pruneLiquidations(hub);
+  const now=Date.now();
+  const events=hub.liquidationEvents.map(e=>({...e})).sort((a,b)=>a.eventTime-b.eventTime);
+  const longs=events.filter(e=>e.liquidationSide==="LONG");
+  const shorts=events.filter(e=>e.liquidationSide==="SHORT");
+  const longUSDT=longs.reduce((s,e)=>s+e.observedNotionalUSDT,0);
+  const shortUSDT=shorts.reduce((s,e)=>s+e.observedNotionalUSDT,0);
+  const totalUSDT=longUSDT+shortUSDT;
+  const feedFresh=hub.connected&&(now-hub.lastWsAt)<10000;
+  const coverageStart=Math.max(hub.startedAt,now-LIQ_WINDOW_MS);
+  const longClusters=clusterLiquidations(events,currentPrice,"LONG");
+  const shortClusters=clusterLiquidations(events,currentPrice,"SHORT");
+  return{
+    status:feedFresh?(events.length?"STREAM_ACTIVE":"STREAM_ACTIVE_NO_EVENTS"):"NOT_AVAILABLE",
+    source:"BINANCE_WS_FORCE_ORDER_OBSERVED",
+    capturedAt:now,
+    requestedWindowMinutes:30,
+    coverageStart,
+    coverageMinutes:Math.max(0,(now-coverageStart)/60000),
+    streamConnected:hub.connected,
+    lastWsAt:hub.lastWsAt||null,
+    eventCount:events.length,
+    longEventCount:longs.length,
+    shortEventCount:shorts.length,
+    longLiquidationUSDT:longUSDT,
+    shortLiquidationUSDT:shortUSDT,
+    totalLiquidationUSDT:totalUSDT,
+    longSharePct:totalUSDT>0?(longUSDT/totalUSDT)*100:0,
+    shortSharePct:totalUSDT>0?(shortUSDT/totalUSDT)*100:0,
+    netObservedPressureUSDT:shortUSDT-longUSDT,
+    longClusters,
+    shortClusters,
+    events
+  };
+}
+
+function marketStatus(symbol){
+  const hub=marketHubs.get(symbol);
+  const now=Date.now();
+  if(!hub)return{connected:false,bookReady:false,bookAge:null,liqReady:false,liqEvents:0,liqCoverage:0};
+  const depthFresh=hub.depth&&(now-hub.depth.receivedAt)<LIVE_STALE_MS;
+  const bookFresh=hub.bookTicker&&(now-hub.bookTicker.receivedAt)<LIVE_STALE_MS;
+  pruneLiquidations(hub);
+  return{
+    connected:hub.connected,
+    bookReady:Boolean(depthFresh&&bookFresh),
+    bookAge:depthFresh?now-hub.depth.receivedAt:null,
+    liqReady:Boolean(hub.connected&&(now-hub.lastWsAt)<10000),
+    liqEvents:hub.liquidationEvents.length,
+    liqCoverage:Math.max(0,(now-hub.startedAt)/60000),
+    lastError:hub.lastError
+  };
+}
+
+async function captureAndStoreMarketSnapshot(symbol,current,restDepth){
+  const hub=ensureMarketStream(symbol);
+  const now=Date.now();
+  const liveDepthFresh=hub.depth&&(now-hub.depth.receivedAt)<LIVE_STALE_MS;
+  const depthRaw=liveDepthFresh?hub.depth:{...restDepth,source:"BINANCE_REST_DEPTH"};
+  const bookTicker=hub.bookTicker&&(now-hub.bookTicker.receivedAt)<LIVE_STALE_MS?hub.bookTicker:null;
+  const orderBook=analyzeOrderBook(depthRaw,current,bookTicker);
+  const liquidations=analyzeLiquidations(hub,current);
+  const snapshot={
+    id:snapshotId(symbol),
+    schemaVersion:1,
+    symbol,
+    fetchedAt:Date.now(),
+    orderBook,
+    liquidations
+  };
+  await putSnapshot(snapshot);
+  return snapshot;
+}
+
+/* ----------------------------- DATA FETCH ------------------------------- */
+async function fetchData(symbol){
+  ensureMarketStream(symbol);
+  const urls=[
+    SM+"/future/smart-money/signal/overview?symbol="+encodeURIComponent(symbol),
+    SM+"/future/smart-money/signal/details/stats?symbol="+encodeURIComponent(symbol)+"&timeRange=30m",
+    FUT+"/fapi/v1/ticker/price?symbol="+encodeURIComponent(symbol),
+    FUT+"/fapi/v1/ticker/24hr?symbol="+encodeURIComponent(symbol),
+    FUT+"/fapi/v1/openInterest?symbol="+encodeURIComponent(symbol),
+    FUT+"/fapi/v1/premiumIndex?symbol="+encodeURIComponent(symbol),
+    FUT+"/fapi/v1/klines?symbol="+encodeURIComponent(symbol)+"&interval=5m&limit=100",
+    FUT+"/fapi/v1/depth?symbol="+encodeURIComponent(symbol)+"&limit=20"
+  ];
+  const [overview,stats30,priceData,volume,oi,funding,candles,restDepth]=await Promise.all(urls.map(req));
+  if(!Array.isArray(candles))throw new Error("Candles response is not an array");
+  if(!restDepth||!Array.isArray(restDepth.bids)||!Array.isArray(restDepth.asks))throw new Error("Order book response is invalid");
+  const validCandles=candles.filter(c=>Array.isArray(c)&&c.length>=6&&[0,1,2,3,4,5].every(i=>Number.isFinite(Number(c[i]))));
+  const candleMeta={
+    interval:"5m",
+    requested:100,
+    loaded:candles.length,
+    valid:validCandles.length,
+    firstTime:candles[0]?.[0]||null,
+    lastTime:candles[candles.length-1]?.[0]||null,
+    loadedOk:candles.length===100&&validCandles.length===100
+  };
+  const candleData=validCandles.map(c=>({time:Number(c[0]),open:Number(c[1]),high:Number(c[2]),low:Number(c[3]),close:Number(c[4]),volume:Number(c[5])}));
+  return{symbol,overview,stats30,price:priceData,volume,openInterest:oi,funding,candles:candleData,candleMeta,restDepth,fetchedAt:Date.now()};
+}
+
 function model(d){
-const o=d.overview?.data||{}, s=d.stats30?.data||{};
-const current=n(d.price?.price), volume=n(d.volume?.quoteVolume);
-const priceChangePct=n(d.volume?.priceChangePercent);
-const oiQty=n(d.openInterest?.openInterest), oiUSDT=oiQty*current;
-const funding=n(d.funding?.lastFundingRate)*100;
+  const o=d.overview?.data||{},s=d.stats30?.data||{};
+  const current=n(d.price?.price),volume=n(d.volume?.quoteVolume);
+  const priceChangePct=n(d.volume?.priceChangePercent);
+  const oiQty=n(d.openInterest?.openInterest),oiUSDT=oiQty*current;
+  const funding=n(d.funding?.lastFundingRate)*100;
 
-const longTraders = o.longTraders ?? o.longTradersCount ?? 0;
-const shortTraders = o.shortTraders ?? o.shortTradersCount ?? 0;
-const longEntry = price(o.longTradersAvgEntryPrice || 0);
-const shortEntry = price(o.shortTradersAvgEntryPrice || 0);
-const longProfitTraders = o.longProfitTraders ?? 0;
-const shortProfitTraders = o.shortProfitTraders ?? 0;
-const longProfitPct = n(longTraders) > 0 ? (n(longProfitTraders) / n(longTraders)) * 100 : 0;
-const shortProfitPct = n(shortTraders) > 0 ? (n(shortProfitTraders) / n(shortTraders)) * 100 : 0;
+  const longTraders=o.longTraders??o.longTradersCount??0;
+  const shortTraders=o.shortTraders??o.shortTradersCount??0;
+  const longEntry=price(o.longTradersAvgEntryPrice||0);
+  const shortEntry=price(o.shortTradersAvgEntryPrice||0);
+  const longProfitTraders=o.longProfitTraders??0;
+  const shortProfitTraders=o.shortProfitTraders??0;
+  const longProfitPct=n(longTraders)>0?(n(longProfitTraders)/n(longTraders))*100:0;
+  const shortProfitPct=n(shortTraders)>0?(n(shortProfitTraders)/n(shortTraders))*100:0;
 
-const longTradersQty = n(o.longTradersQty || 0);
-const shortTradersQty = n(o.shortTradersQty || 0);
-const longTradersUSDT = longTradersQty * current;
-const shortTradersUSDT = shortTradersQty * current;
-const totalTradersUSDT = longTradersUSDT + shortTradersUSDT;
+  const longTradersQty=n(o.longTradersQty||0),shortTradersQty=n(o.shortTradersQty||0);
+  const longTradersUSDT=longTradersQty*current,shortTradersUSDT=shortTradersQty*current;
+  const totalTradersUSDT=longTradersUSDT+shortTradersUSDT;
 
-const longWhales = o.longWhales ?? o.longWhalesCount ?? 0;
-const shortWhales = o.shortWhales ?? o.shortWhalesCount ?? 0;
-const longWhaleEntry = price(o.longWhalesAvgEntryPrice || 0);
-const shortWhaleEntry = price(o.shortWhalesAvgEntryPrice || 0);
-const longProfitWhales = o.longProfitWhales ?? 0;
-const shortProfitWhales = o.shortProfitWhales ?? 0;
-const longWhaleProfitPct = n(longWhales) > 0 ? (n(longProfitWhales) / n(longWhales)) * 100 : 0;
-const shortWhaleProfitPct = n(shortWhales) > 0 ? (n(shortProfitWhales) / n(shortWhales)) * 100 : 0;
+  const longWhales=o.longWhales??o.longWhalesCount??0;
+  const shortWhales=o.shortWhales??o.shortWhalesCount??0;
+  const longWhaleEntry=price(o.longWhalesAvgEntryPrice||0);
+  const shortWhaleEntry=price(o.shortWhalesAvgEntryPrice||0);
+  const longProfitWhales=o.longProfitWhales??0;
+  const shortProfitWhales=o.shortProfitWhales??0;
+  const longWhaleProfitPct=n(longWhales)>0?(n(longProfitWhales)/n(longWhales))*100:0;
+  const shortWhaleProfitPct=n(shortWhales)>0?(n(shortProfitWhales)/n(shortWhales))*100:0;
 
-const longWhalesQty = n(o.longWhalesQty || 0);
-const shortWhalesQty = n(o.shortWhalesQty || 0);
-const longWhalesUSDT = longWhalesQty * current;
-const shortWhalesUSDT = shortWhalesQty * current;
-const totalWhalesUSDT = longWhalesUSDT + shortWhalesUSDT;
+  const longWhalesQty=n(o.longWhalesQty||0),shortWhalesQty=n(o.shortWhalesQty||0);
+  const longWhalesUSDT=longWhalesQty*current,shortWhalesUSDT=shortWhalesQty*current;
+  const totalWhalesUSDT=longWhalesUSDT+shortWhalesUSDT;
 
-return{
- current, volume, priceChangePct, oiUSDT, funding,
- 
- longTraders, shortTraders,
- totalTradersPos: compact(totalTradersUSDT),
- longTradersPos: compact(longTradersUSDT), 
- shortTradersPos: compact(shortTradersUSDT),
- longEntry, shortEntry,
- longProfitTraders, shortProfitTraders,
- longProfitPct: pct(longProfitPct), shortProfitPct: pct(shortProfitPct),
+  return{
+    current,volume,priceChangePct,oiUSDT,funding,
+    longTraders,shortTraders,
+    totalTradersPos:compact(totalTradersUSDT),
+    longTradersPos:compact(longTradersUSDT),shortTradersPos:compact(shortTradersUSDT),
+    longEntry,shortEntry,longProfitTraders,shortProfitTraders,
+    longProfitPct:pct(longProfitPct),shortProfitPct:pct(shortProfitPct),
+    longWhales,shortWhales,
+    totalWhalesPos:compact(totalWhalesUSDT),
+    longWhalesPos:compact(longWhalesUSDT),shortWhalesPos:compact(shortWhalesUSDT),
+    longWhaleEntry,shortWhaleEntry,longProfitWhales,shortProfitWhales,
+    longWhaleProfitPct:pct(longWhaleProfitPct),shortWhaleProfitPct:pct(shortWhaleProfitPct),
+    l30Traders:`L ${s.longTraders??"-"} | S ${s.shortTraders??"-"}`,
+    l30Whales:`L ${s.longWhales??"-"} | S ${s.shortWhales??"-"}`,
+    l30Pos:`L ${compact(s.longPositions)} | S ${compact(s.shortPositions)}`,
+    l30Qty:`L ${compact(s.longQty)} | S ${compact(s.shortQty)}`,
+    candleMeta:d.candleMeta||{interval:"5m",requested:100,loaded:0,valid:0,loadedOk:false},
+    candles:Array.isArray(d.candles)?d.candles:[]
+  };
+}
 
- longWhales, shortWhales,
- totalWhalesPos: compact(totalWhalesUSDT),
- longWhalesPos: compact(longWhalesUSDT), 
- shortWhalesPos: compact(shortWhalesUSDT),
- longWhaleEntry, shortWhaleEntry,
- longProfitWhales, shortProfitWhales,
- longWhaleProfitPct: pct(longWhaleProfitPct), shortWhaleProfitPct: pct(shortWhaleProfitPct),
+function snapshotSummary(snapshot){
+  const ob=snapshot?.orderBook||{};
+  const liq=snapshot?.liquidations||{};
+  return{
+    orderBook:{
+      status:ob.status||"NOT_AVAILABLE",
+      source:ob.source||"NOT_AVAILABLE",
+      bidsLoaded:ob.bidsLoaded||0,
+      asksLoaded:ob.asksLoaded||0,
+      spreadBps:n(ob.spreadBps),
+      imbalancePct:n(ob.imbalancePct),
+      capturedAt:ob.capturedAt||null
+    },
+    liquidations:{
+      status:liq.status||"NOT_AVAILABLE",
+      source:liq.source||"NOT_AVAILABLE",
+      eventCount:liq.eventCount||0,
+      longLiquidationUSDT:n(liq.longLiquidationUSDT),
+      shortLiquidationUSDT:n(liq.shortLiquidationUSDT),
+      coverageMinutes:n(liq.coverageMinutes),
+      capturedAt:liq.capturedAt||null
+    }
+  };
+}
 
- l30Traders:`L ${s.longTraders ?? "-"} | S ${s.shortTraders ?? "-"}`,
- l30Whales:`L ${s.longWhales ?? "-"} | S ${s.shortWhales ?? "-"}`,
- l30Pos:`L ${compact(s.longPositions)} | S ${compact(s.shortPositions)}`,
- l30Qty:`L ${compact(s.longQty)} | S ${compact(s.shortQty)}`,
- candleMeta:d.candleMeta||{interval:"30m",requested:100,loaded:0,valid:0,loadedOk:false},
- candles:Array.isArray(d.candles)?d.candles:[]
-};
+async function buildLogEntry(symbol,data){
+  const vm=model(data);
+  let snapshot=null;
+  let snapshotError=null;
+  try{
+    snapshot=await captureAndStoreMarketSnapshot(symbol,vm.current,data.restDepth);
+  }catch(e){
+    console.error("Market snapshot persistence failed",e);
+    snapshotError=e.message;
+    // Order book still has a reliable REST fallback for the visible log summary.
+    const hub=ensureMarketStream(symbol);
+    snapshot={
+      id:null,schemaVersion:1,symbol,fetchedAt:Date.now(),
+      orderBook:analyzeOrderBook({...data.restDepth,source:"BINANCE_REST_DEPTH"},vm.current,hub.bookTicker),
+      liquidations:analyzeLiquidations(hub,vm.current)
+    };
+  }
+  return{
+    viewModel:vm,
+    candleMeta:vm.candleMeta||null,
+    fetchedAt:Date.now(),
+    marketSnapshotId:snapshot.id||null,
+    marketSummary:snapshotSummary(snapshot),
+    marketSnapshotError:snapshotError
+  };
+}
+
+/* ------------------------------- RENDER --------------------------------- */
+function badgeHtml(kind,text,cls="warn"){
+  return`<span class="feed-badge ${cls}" data-feed-kind="${kind}">${text}</span>`;
+}
+
+function liveStripHtml(symbol){
+  const s=marketStatus(symbol);
+  const ws=s.connected?badgeHtml("ws","● MARKET WS LIVE","ok pulse"):badgeHtml("ws","● MARKET WS CONNECTING",s.lastError?"err":"warn");
+  const book=s.bookReady?badgeHtml("book",`ORDER BOOK ✓ ${ORDERBOOK_LEVELS}×${ORDERBOOK_LEVELS} • ${formatAge(s.bookAge)}`,"ok"):badgeHtml("book","ORDER BOOK • CONNECTING","warn");
+  const liq=s.liqReady?badgeHtml("liq",`LIQUIDATIONS ✓ ${s.liqEvents} EVENTS • ${Math.min(30,s.liqCoverage).toFixed(1)}m COVERAGE`,s.liqEvents?"purple":"ok"):badgeHtml("liq","LIQUIDATIONS • CONNECTING","warn");
+  return`<div class="market-strip" id="market-strip-${symbol}">${ws}${book}${liq}</div>`;
+}
+
+function rowMarketCells(log){
+  const ob=log.marketSummary?.orderBook;
+  const liq=log.marketSummary?.liquidations;
+  const obOk=ob?.status==="READY";
+  const liqOk=liq?.status==="STREAM_ACTIVE"||liq?.status==="STREAM_ACTIVE_NO_EVENTS";
+  const obText=obOk?`✓ BOOK ${ob.bidsLoaded}/${ob.asksLoaded}<br><span class="mini-detail">IMB ${n(ob.imbalancePct).toFixed(1)}% • ${n(ob.spreadBps).toFixed(2)}bps</span>`:"NOT_AVAILABLE";
+  const liqText=liqOk?`✓ LIQ ${liq.eventCount||0} EVT<br><span class="mini-detail">L ${compact(liq.longLiquidationUSDT)} • S ${compact(liq.shortLiquidationUSDT)}</span>`:"NOT_AVAILABLE";
+  return`<td><span class="row-data-badge ${obOk?"ok":"warn"}">${obText}</span></td><td><span class="row-data-badge ${liqOk?"purple":"warn"}">${liqText}</span></td>`;
 }
 
 function render(){
-if(!records.length){recordsEl.innerHTML='<div class="empty">No records found. Search for a coin symbol to build your logs.</div>';return}
-const now = Math.floor(Date.now() / 1000);
+  if(!records.length){recordsEl.innerHTML='<div class="empty">No records found. Search for a coin symbol to build your logs.</div>';return}
+  const now=Math.floor(Date.now()/1000);
 
-recordsEl.innerHTML=records.map(r=>{
-const intervalSec = r.intervalSec || DEFAULT_INTERVAL;
-const timeLeft = Math.max(0, (r.nextFetchTime || (now + intervalSec)) - now);
-const mins = String(Math.floor(timeLeft / 60)).padStart(2, '0');
-const secs = String(timeLeft % 60).padStart(2, '0');
-const isFinished = timeLeft === 0 || r.fetchedDone;
-const hasMultipleLogs = r.logs && r.logs.length >= 2;
-const currentMinutesMin = intervalSec / 60;
+  recordsEl.innerHTML=records.map(r=>{
+    const intervalSec=r.intervalSec||DEFAULT_INTERVAL;
+    const timeLeft=Math.max(0,(r.nextFetchTime||(now+intervalSec))-now);
+    const mins=String(Math.floor(timeLeft/60)).padStart(2,"0");
+    const secs=String(timeLeft%60).padStart(2,"0");
+    const isFinished=timeLeft===0||r.fetchedDone;
+    const hasMultipleLogs=r.logs&&r.logs.length>=2;
+    const currentMinutesMin=intervalSec/60;
 
-const rowsHtml = r.logs.map((log, idx)=>{
-const vm=log.viewModel;
-const isUp = vm.priceChangePct >= 0;
-return `<tr>
-  <td style="color:var(--muted)">#${r.logs.length - idx} <span style="font-size:10px;margin-left:4px">${new Date(log.fetchedAt).toLocaleTimeString()}</span></td>
-  <td><span class="candle-meta ${vm.candleMeta?.loadedOk?'ok':(vm.candleMeta?.loaded>0?'warn':'err')}">${vm.candleMeta?.loaded??0}/${vm.candleMeta?.requested??100} • ${vm.candleMeta?.valid??0} valid ${vm.candleMeta?.loadedOk?'✓':'⚠'}</span></td>
-  <td class="${isUp?'up':'down'}">$${price(vm.current)} (${isUp?'+':''}${vm.priceChangePct.toFixed(2)}%)</td>
-  <td>${compact(vm.volume)}</td>
-  <td>${compact(vm.oiUSDT)}</td>
-  <td>${vm.funding.toFixed(4)}%</td>
-  
-  <td class="buy">${vm.longTraders}</td><td class="sell">${vm.shortTraders}</td>
-  <td class="total-col">${vm.totalTradersPos}</td>
-  <td class="buy">${vm.longTradersPos}</td><td class="sell">${vm.shortTradersPos}</td>
-  <td>${vm.longEntry}</td><td>${vm.shortEntry}</td>
-  <td class="pos">${vm.longProfitTraders} (${vm.longProfitPct})</td><td class="pos">${vm.shortProfitTraders} (${vm.shortProfitPct})</td>
-  
-  <td class="buy">${vm.longWhales}</td><td class="sell">${vm.shortWhales}</td>
-  <td class="total-col">${vm.totalWhalesPos}</td>
-  <td class="buy">${vm.longWhalesPos}</td><td class="sell">${vm.shortWhalesPos}</td>
-  <td>${vm.longWhaleEntry}</td><td>${vm.shortWhaleEntry}</td>
-  <td class="pos">${vm.longProfitWhales} (${vm.longWhaleProfitPct})</td><td class="pos">${vm.shortProfitWhales} (${vm.shortWhaleProfitPct})</td>
-  
-  <td>${vm.l30Traders}</td><td>${vm.l30Whales}</td><td>${vm.l30Pos}</td><td>${vm.l30Qty}</td>
-  <td>
-    <div class="actions-cell">
-      <button class="row-btn" onclick="deleteLog('${r.symbol}', ${idx})">DEL</button>
-    </div>
-  </td>
-</tr>`;
-}).join("");
+    const rowsHtml=r.logs.map((log,idx)=>{
+      const vm=log.viewModel||{};
+      const isUp=n(vm.priceChangePct)>=0;
+      return`<tr>
+        <td style="color:var(--muted)">#${r.logs.length-idx} <span style="font-size:10px;margin-left:4px">${new Date(log.fetchedAt).toLocaleTimeString()}</span></td>
+        <td><span class="candle-meta ${vm.candleMeta?.loadedOk?'ok':(vm.candleMeta?.loaded>0?'warn':'err')}">${vm.candleMeta?.loaded??0}/${vm.candleMeta?.requested??100} • ${vm.candleMeta?.valid??0} valid ${vm.candleMeta?.loadedOk?'✓':'⚠'}</span></td>
+        <td class="${isUp?'up':'down'}">$${price(vm.current)} (${isUp?'+':''}${n(vm.priceChangePct).toFixed(2)}%)</td>
+        <td>${compact(vm.volume)}</td>
+        <td>${compact(vm.oiUSDT)}</td>
+        <td>${n(vm.funding).toFixed(4)}%</td>
+        ${rowMarketCells(log)}
+        <td class="buy">${vm.longTraders??0}</td><td class="sell">${vm.shortTraders??0}</td>
+        <td class="total-col">${vm.totalTradersPos??"--"}</td>
+        <td class="buy">${vm.longTradersPos??"--"}</td><td class="sell">${vm.shortTradersPos??"--"}</td>
+        <td>${vm.longEntry??"--"}</td><td>${vm.shortEntry??"--"}</td>
+        <td class="pos">${vm.longProfitTraders??0} (${vm.longProfitPct??"--"})</td><td class="pos">${vm.shortProfitTraders??0} (${vm.shortProfitPct??"--"})</td>
+        <td class="buy">${vm.longWhales??0}</td><td class="sell">${vm.shortWhales??0}</td>
+        <td class="total-col">${vm.totalWhalesPos??"--"}</td>
+        <td class="buy">${vm.longWhalesPos??"--"}</td><td class="sell">${vm.shortWhalesPos??"--"}</td>
+        <td>${vm.longWhaleEntry??"--"}</td><td>${vm.shortWhaleEntry??"--"}</td>
+        <td class="pos">${vm.longProfitWhales??0} (${vm.longWhaleProfitPct??"--"})</td><td class="pos">${vm.shortProfitWhales??0} (${vm.shortWhaleProfitPct??"--"})</td>
+        <td>${vm.l30Traders??"--"}</td><td>${vm.l30Whales??"--"}</td><td>${vm.l30Pos??"--"}</td><td>${vm.l30Qty??"--"}</td>
+        <td><div class="actions-cell"><button class="row-btn" onclick="deleteLog('${r.symbol}',${idx})">DEL</button></div></td>
+      </tr>`;
+    }).join("");
 
-return `<article class="record-card" data-symbol="${r.symbol}">
-  <div class="record-header">
-    <h3 class="symbol-title">${r.symbol} <span style="font-size:12px;color:var(--muted);font-weight:normal">(${r.logs.length} Logs)</span>${(()=>{const cm=r.logs[0]?.viewModel?.candleMeta||r.logs[0]?.candleMeta||{requested:100,loaded:0,valid:0,loadedOk:false};const cls=cm.loadedOk?'ok':(cm.loaded>0?'warn':'err');return `<span class="candle-meta ${cls}">🕯 Candles ${cm.loaded}/${cm.requested} • Valid ${cm.valid} ${cm.loadedOk?'✓':'⚠'}</span>`;})()}</h3>
-    <div class="header-actions">
-      <div class="timer-control">
-        <span class="timer-badge ${isFinished?'finished':''}" id="timer-${r.symbol}">${isFinished ? '✨ READY' : `⏱ ${mins}:${secs}`}</span>
-        <select class="interval-select" onchange="changeInterval('${r.symbol}', this.value)">
-          <option value="5" ${currentMinutesMin===5?'selected':''}>5m</option>
-          <option value="10" ${currentMinutesMin===10?'selected':''}>10m</option>
-          <option value="20" ${currentMinutesMin===20?'selected':''}>20m</option>
-          <option value="30" ${currentMinutesMin===30?'selected':''}>30m</option>
-        </select>
+    return`<article class="record-card" data-symbol="${r.symbol}">
+      <div class="record-header">
+        <div class="record-title-block">
+          <h3 class="symbol-title">${r.symbol} <span style="font-size:12px;color:var(--muted);font-weight:normal">(${r.logs.length} Logs)</span>${(()=>{const cm=r.logs[0]?.viewModel?.candleMeta||r.logs[0]?.candleMeta||{requested:100,loaded:0,valid:0,loadedOk:false};const cls=cm.loadedOk?'ok':(cm.loaded>0?'warn':'err');return`<span class="candle-meta ${cls}">🕯 5m Candles ${cm.loaded}/${cm.requested} • Valid ${cm.valid} ${cm.loadedOk?'✓':'⚠'}</span>`})()}</h3>
+          ${liveStripHtml(r.symbol)}
+        </div>
+        <div class="header-actions">
+          <div class="timer-control">
+            <span class="timer-badge ${isFinished?'finished':''}" id="timer-${r.symbol}">${isFinished?'✨ READY':`⏱ ${mins}:${secs}`}</span>
+            <select class="interval-select" onchange="changeInterval('${r.symbol}',this.value)">
+              <option value="5" ${currentMinutesMin===5?'selected':''}>5m</option>
+              <option value="10" ${currentMinutesMin===10?'selected':''}>10m</option>
+              <option value="20" ${currentMinutesMin===20?'selected':''}>20m</option>
+              <option value="30" ${currentMinutesMin===30?'selected':''}>30m</option>
+            </select>
+          </div>
+          <button class="small-btn gemini" onclick="copyToGemini('${r.symbol}')">✨ COPY TO GEMINI</button>
+          <button class="small-btn gemini-compare" ${hasMultipleLogs?'':'disabled'} onclick="copyToGeminiCompare('${r.symbol}')">📊 COMPARE ALL LOGS</button>
+          <button class="small-btn fetch" onclick="resetAndFetch('${r.symbol}')">+ FETCH</button>
+          <button class="small-btn del" onclick="delCoin('${r.symbol}')">DELETE</button>
+        </div>
       </div>
-      <button class="small-btn gemini" onclick="copyToGemini('${r.symbol}')">✨ COPY TO GEMINI</button>
-      <button class="small-btn gemini-compare" ${hasMultipleLogs?'':'disabled'} onclick="copyToGeminiCompare('${r.symbol}')">📊 COMPARE ALL LOGS</button>
-      <button class="small-btn fetch" onclick="resetAndFetch('${r.symbol}')">+ FETCH</button>
-      <button class="small-btn del" onclick="delCoin('${r.symbol}')">DELETE</button>
-    </div>
-  </div>
-  <div class="table-container">
-    <table class="logs-table">
-      <thead>
-        <tr>
-          <th>Time / Log</th>
-          <th>Candles<br>5m</th>
-          <th>Price & 24h%</th>
-          <th>Volume</th>
-          <th>Open<br>Interest</th>
-          <th>Funding</th>
-          
-          <th style="color:var(--green)">Traders<br>(L)</th>
-          <th style="color:var(--red)">Traders<br>(S)</th>
-          <th class="total-col">Total<br>Traders Pos</th>
-          
-          <th style="color:var(--green)">Current Positions<br>(USDT) • Trader (L)</th>
-          <th style="color:var(--red)">Current Positions<br>(USDT) • Trader (S)</th>
-          
-          <th>Avg<br>Entry(L)</th>
-          <th>Avg<br>Entry(S)</th>
-          <th>Profit<br>Traders(L)</th>
-          <th>Profit<br>Traders(S)</th>
-          
-          <th style="color:var(--green)">Whales<br>(L)</th>
-          <th style="color:var(--red)">Whales<br>(S)</th>
-          <th class="total-col">Total<br>Whales Pos</th>
-          
-          <th style="color:var(--green)">Current Positions<br>(USDT) • Whale (L)</th>
-          <th style="color:var(--red)">Current Positions<br>(USDT) • Whale (S)</th>
-          
-          <th>Avg<br>Entry(L)</th>
-          <th>Avg<br>Entry(S)</th>
-          <th>Profit<br>Whales(L)</th>
-          <th>Profit<br>Whales(S)</th>
-          
-          <th>30m<br>T.Flow</th>
-          <th>30m<br>W.Flow</th>
-          <th>30m<br>Pos.Flow</th>
-          <th>30m<br>Qty.Flow</th>
-          <th>Act</th>
-        </tr>
-      </thead>
-      <tbody>${rowsHtml}</tbody>
-    </table>
-  </div>
-</article>`;
-}).join("");
+      <div class="table-container">
+        <table class="logs-table">
+          <thead><tr>
+            <th>Time / Log</th><th>Candles<br>5m</th><th>Price & 24h%</th><th>Volume</th><th>Open<br>Interest</th><th>Funding</th>
+            <th class="micro-head">Order Book<br>20×20</th><th class="micro-head purple-text">Liquidations<br>Observed</th>
+            <th style="color:var(--green)">Traders<br>(L)</th><th style="color:var(--red)">Traders<br>(S)</th><th class="total-col">Total<br>Traders Pos</th>
+            <th style="color:var(--green)">Current Positions<br>(USDT) • Trader (L)</th><th style="color:var(--red)">Current Positions<br>(USDT) • Trader (S)</th>
+            <th>Avg<br>Entry(L)</th><th>Avg<br>Entry(S)</th><th>Profit<br>Traders(L)</th><th>Profit<br>Traders(S)</th>
+            <th style="color:var(--green)">Whales<br>(L)</th><th style="color:var(--red)">Whales<br>(S)</th><th class="total-col">Total<br>Whales Pos</th>
+            <th style="color:var(--green)">Current Positions<br>(USDT) • Whale (L)</th><th style="color:var(--red)">Current Positions<br>(USDT) • Whale (S)</th>
+            <th>Avg<br>Entry(L)</th><th>Avg<br>Entry(S)</th><th>Profit<br>Whales(L)</th><th>Profit<br>Whales(S)</th>
+            <th>30m<br>T.Flow</th><th>30m<br>W.Flow</th><th>30m<br>Pos.Flow</th><th>30m<br>Qty.Flow</th><th>Act</th>
+          </tr></thead>
+          <tbody>${rowsHtml}</tbody>
+        </table>
+      </div>
+    </article>`;
+  }).join("");
+  updateFeedBadges();
 }
 
-function changeInterval(symbol, minsVal){
-const r=records.find(x=>x.symbol===symbol);
-if(r){
-  const newSec = parseInt(minsVal) * 60;
-  r.intervalSec = newSec;
-  const now = Math.floor(Date.now() / 1000);
-  r.nextFetchTime = now + newSec;
-  r.fetchedDone = false;
+function updateFeedBadges(){
+  for(const r of records){
+    const el=document.getElementById(`market-strip-${r.symbol}`);
+    if(el)el.outerHTML=liveStripHtml(r.symbol);
+  }
+}
+
+/* ----------------------------- USER ACTIONS ----------------------------- */
+function changeInterval(symbol,minsVal){
+  const r=records.find(x=>x.symbol===symbol);
+  if(!r)return;
+  const newSec=parseInt(minsVal,10)*60;
+  r.intervalSec=newSec;
+  r.nextFetchTime=Math.floor(Date.now()/1000)+newSec;
+  r.fetchedDone=false;
   save();render();
   setStatus(`Timer interval for ${symbol} updated to ${minsVal} minutes.`,"ok");
 }
-}
 
 async function searchCoin(){
-const symbol=sym(coin.value);if(!symbol){setStatus("Please enter a valid coin symbol.","err");return}
-search.disabled=true;setStatus(`Fetching data for ${symbol}...`);
-try{
-const data=await fetchData(symbol);
-const vm=model(data);
-const logEntry={viewModel:vm, candleMeta:vm.candleMeta||null, fetchedAt:Date.now()};
-let existing=records.find(x=>x.symbol===symbol);
-const now = Math.floor(Date.now() / 1000);
-if(existing){
-  existing.logs.unshift(logEntry);
-  const interval = existing.intervalSec || DEFAULT_INTERVAL;
-  existing.nextFetchTime = now + interval;
-  existing.fetchedDone = false;
-}else{
-  records.unshift({symbol, logs:[logEntry], intervalSec: DEFAULT_INTERVAL, nextFetchTime: now + DEFAULT_INTERVAL, fetchedDone: false});
-}
-save();render();coin.value="";const cm=vm.candleMeta;setStatus(`${symbol} log added successfully. Candles: ${cm.loaded}/${cm.requested} loaded, ${cm.valid} valid${cm.loadedOk?" ✓":" ⚠"}.`,cm.loadedOk?"ok":"err");
-}catch(e){console.error(e);setStatus(`Failed to load ${symbol}: ${e.message}`,"err")}finally{search.disabled=false}
+  const symbol=sym(coin.value);
+  if(!symbol){setStatus("Please enter a valid coin symbol.","err");return}
+  search.disabled=true;
+  ensureMarketStream(symbol);
+  setStatus(`Fetching SmartMoney + price + 5m candles + order book for ${symbol}...`);
+  try{
+    const data=await fetchData(symbol);
+    const logEntry=await buildLogEntry(symbol,data);
+    let existing=records.find(x=>x.symbol===symbol);
+    const now=Math.floor(Date.now()/1000);
+    if(existing){
+      existing.logs.unshift(logEntry);
+      const interval=existing.intervalSec||DEFAULT_INTERVAL;
+      existing.nextFetchTime=now+interval;
+      existing.fetchedDone=false;
+    }else{
+      records.unshift({symbol,logs:[logEntry],intervalSec:DEFAULT_INTERVAL,nextFetchTime:now+DEFAULT_INTERVAL,fetchedDone:false});
+    }
+    save();render();coin.value="";
+    const cm=logEntry.viewModel.candleMeta;
+    const ob=logEntry.marketSummary?.orderBook;
+    const liq=logEntry.marketSummary?.liquidations;
+    setStatus(`${symbol} complete snapshot saved. Candles ${cm.loaded}/${cm.requested} ✓ • Order Book ${ob?.status==='READY'?'✓':'⚠'} • Liquidation feed ${liq?.status?.startsWith('STREAM_ACTIVE')?'✓':'warming up'}.`,ob?.status==='READY'?"ok":"err");
+  }catch(e){
+    console.error(e);
+    if(!records.some(r=>r.symbol===symbol))stopMarketStream(symbol);
+    setStatus(`Failed to load ${symbol}: ${e.message}`,"err");
+  }finally{search.disabled=false}
 }
 
 async function resetAndFetch(symbol){
-setStatus(`Fetching new log for ${symbol}...`);
-try{
-const data=await fetchData(symbol);
-const vm=model(data);
-const logEntry={viewModel:vm, candleMeta:vm.candleMeta||null, fetchedAt:Date.now()};
-const existing=records.find(x=>x.symbol===symbol);
-const now = Math.floor(Date.now() / 1000);
-if(existing){
-  existing.logs.unshift(logEntry);
-  const interval = existing.intervalSec || DEFAULT_INTERVAL;
-  existing.nextFetchTime = now + interval;
-  existing.fetchedDone = false;
-  save();render();setStatus(`New log added for ${symbol}.`,"ok");
-}
-}catch(e){console.error(e);setStatus(`Failed: ${e.message}`,"err")}
-}
-
-function deleteLog(symbol, idx){
-if(!confirm("Delete this log row?"))return;
-const r=records.find(x=>x.symbol===symbol);
-if(r){r.logs.splice(idx,1);if(!r.logs.length)records=records.filter(x=>x.symbol!==symbol);save();render();setStatus("Log row deleted.","ok");}
+  ensureMarketStream(symbol);
+  setStatus(`Fetching complete new snapshot for ${symbol}...`);
+  try{
+    const data=await fetchData(symbol);
+    const logEntry=await buildLogEntry(symbol,data);
+    const existing=records.find(x=>x.symbol===symbol);
+    const now=Math.floor(Date.now()/1000);
+    if(existing){
+      existing.logs.unshift(logEntry);
+      existing.nextFetchTime=now+(existing.intervalSec||DEFAULT_INTERVAL);
+      existing.fetchedDone=false;
+      save();render();
+      const ob=logEntry.marketSummary?.orderBook;
+      const liq=logEntry.marketSummary?.liquidations;
+      setStatus(`New complete log saved for ${symbol}. ORDER BOOK ${ob?.status==='READY'?'✓':'⚠'} • LIQUIDATIONS ${liq?.status?.startsWith('STREAM_ACTIVE')?'✓':'warming up'}.`,"ok");
+    }
+  }catch(e){console.error(e);setStatus(`Failed: ${e.message}`,"err")}
 }
 
-function delCoin(symbol){
-if(!confirm(`Delete all logs for ${symbol}?`))return;
-records=records.filter(x=>x.symbol!==symbol);save();render();setStatus(`${symbol} deleted.`,"ok");
+async function deleteLog(symbol,idx){
+  if(!confirm("Delete this log row?"))return;
+  const r=records.find(x=>x.symbol===symbol);
+  if(!r)return;
+  const [removed]=r.logs.splice(idx,1);
+  if(removed?.marketSnapshotId)deleteSnapshot(removed.marketSnapshotId);
+  if(!r.logs.length){records=records.filter(x=>x.symbol!==symbol);stopMarketStream(symbol)}
+  save();render();setStatus("Log row deleted.","ok");
 }
 
+async function delCoin(symbol){
+  if(!confirm(`Delete all logs for ${symbol}?`))return;
+  const record=records.find(x=>x.symbol===symbol);
+  records=records.filter(x=>x.symbol!==symbol);
+  stopMarketStream(symbol);
+  save();render();
+  if(record)deleteSnapshotsForRecord(record);
+  setStatus(`${symbol} deleted.`,"ok");
+}
+
+/* --------------------------- GEMINI FORMATTERS -------------------------- */
 function formatCandlesForGemini(candles){
-  if(!Array.isArray(candles) || !candles.length){
-    return "NO_AVAILABLE_CANDLE_DATA";
-  }
+  if(!Array.isArray(candles)||!candles.length)return"NO_AVAILABLE_CANDLE_DATA";
   return candles.map((c,i)=>{
     const t=new Date(Number(c.time)).toISOString();
-    return `Candle ${i+1}/${candles.length} | Time: ${t} | Open: ${c.open} | High: ${c.high} | Low: ${c.low} | Close: ${c.close} | Volume: ${c.volume}`;
+    return`Candle ${i+1}/${candles.length} | Time: ${t} | Open: ${c.open} | High: ${c.high} | Low: ${c.low} | Close: ${c.close} | Volume: ${c.volume}`;
   }).join("\n");
 }
 
-async function copyPromptToClipboard(text){
-  if(navigator.clipboard && window.isSecureContext){
-    await navigator.clipboard.writeText(text);
-    return;
-  }
-  const ta=document.createElement("textarea");
-  ta.value=text;
-  ta.setAttribute("readonly","");
-  ta.style.position="fixed";
-  ta.style.left="-9999px";
-  ta.style.top="0";
-  document.body.appendChild(ta);
-  ta.focus();
-  ta.select();
-  ta.setSelectionRange(0, ta.value.length);
-  const ok=document.execCommand("copy");
-  document.body.removeChild(ta);
-  if(!ok) throw new Error("Clipboard access is blocked by the browser");
+function formatOrderBookForGemini(ob){
+  if(!ob||ob.status!=="READY")return"ORDER BOOK STATUS: NOT_AVAILABLE";
+  const bidWalls=(ob.bidWalls||[]).map((w,i)=>`Bid Wall ${i+1} | Price: ${w.price} | Qty: ${w.qty} | Notional USDT: ${w.notionalUSDT} | Strength vs median: ${w.strengthVsMedian}`).join("\n")||"NONE";
+  const askWalls=(ob.askWalls||[]).map((w,i)=>`Ask Wall ${i+1} | Price: ${w.price} | Qty: ${w.qty} | Notional USDT: ${w.notionalUSDT} | Strength vs median: ${w.strengthVsMedian}`).join("\n")||"NONE";
+  const bids=(ob.bids||[]).map((x,i)=>`Bid ${i+1}/${ob.bids.length} | Price: ${x.price} | Qty: ${x.qty} | Notional USDT: ${x.notionalUSDT}`).join("\n");
+  const asks=(ob.asks||[]).map((x,i)=>`Ask ${i+1}/${ob.asks.length} | Price: ${x.price} | Qty: ${x.qty} | Notional USDT: ${x.notionalUSDT}`).join("\n");
+  return`ORDER BOOK STATUS: READY
+Source: ${ob.source}
+Captured At: ${new Date(ob.capturedAt).toISOString()}
+Levels: ${ob.bidsLoaded} bids / ${ob.asksLoaded} asks
+Best Bid: ${ob.bestBid} | Best Bid Qty: ${ob.bestBidQty}
+Best Ask: ${ob.bestAsk} | Best Ask Qty: ${ob.bestAskQty}
+Mid Price: ${ob.midPrice}
+Spread: ${ob.spread}
+Spread BPS: ${ob.spreadBps}
+Bid Depth USDT: ${ob.bidDepthUSDT}
+Ask Depth USDT: ${ob.askDepthUSDT}
+Order Imbalance: ${ob.imbalancePct}%
+
+BID WALL CANDIDATES
+${bidWalls}
+
+ASK WALL CANDIDATES
+${askWalls}
+
+ALL CAPTURED BID LEVELS
+${bids}
+
+ALL CAPTURED ASK LEVELS
+${asks}`;
 }
 
-function copyToGemini(symbol){
-const r=records.find(x=>x.symbol===symbol);
-if(!r || !r.logs || !r.logs.length)return;
-const vm = r.logs[0].viewModel || {};
-const candleText = formatCandlesForGemini(vm.candles || []);
+function formatLiquidationsForGemini(liq){
+  if(!liq||liq.status==="NOT_AVAILABLE")return"LIQUIDATION FEED STATUS: NOT_AVAILABLE";
+  const longClusters=(liq.longClusters||[]).map((c,i)=>`Observed LONG Cluster ${i+1}/${liq.longClusters.length} | Price: ${c.price} | Events: ${c.eventCount} | Observed Notional USDT: ${c.observedNotionalUSDT} | Qty: ${c.qty} | Distance from current: ${c.distancePct}% | First: ${new Date(c.firstEventTime).toISOString()} | Last: ${new Date(c.lastEventTime).toISOString()}`).join("\n")||"NO_OBSERVED_LONG_CLUSTERS";
+  const shortClusters=(liq.shortClusters||[]).map((c,i)=>`Observed SHORT Cluster ${i+1}/${liq.shortClusters.length} | Price: ${c.price} | Events: ${c.eventCount} | Observed Notional USDT: ${c.observedNotionalUSDT} | Qty: ${c.qty} | Distance from current: ${c.distancePct}% | First: ${new Date(c.firstEventTime).toISOString()} | Last: ${new Date(c.lastEventTime).toISOString()}`).join("\n")||"NO_OBSERVED_SHORT_CLUSTERS";
+  const events=(liq.events||[]).map((e,i)=>`Liquidation Event ${i+1}/${liq.events.length} | Event Time: ${new Date(e.eventTime).toISOString()} | Liquidated Side: ${e.liquidationSide} | Order Side: ${e.orderSide} | Original Qty: ${e.originalQty} | Filled Qty: ${e.filledQty} | Order Price: ${e.price} | Avg Price: ${e.averagePrice} | Observed Price: ${e.observedPrice} | Observed Notional USDT: ${e.observedNotionalUSDT} | Status: ${e.status}`).join("\n")||"NO_LIQUIDATION_EVENTS_OBSERVED_DURING_COVERAGE";
+  return`LIQUIDATION FEED STATUS: ${liq.status}
+Source: ${liq.source}
+Captured At: ${new Date(liq.capturedAt).toISOString()}
+Requested Window: ${liq.requestedWindowMinutes} minutes
+Actual Observed Coverage: ${liq.coverageMinutes.toFixed(3)} minutes
+Coverage Start: ${new Date(liq.coverageStart).toISOString()}
+Stream Connected At Capture: ${liq.streamConnected}
+Observed Events: ${liq.eventCount}
+Observed LONG Liquidation Events: ${liq.longEventCount}
+Observed SHORT Liquidation Events: ${liq.shortEventCount}
+Observed LONG Liquidation USDT: ${liq.longLiquidationUSDT}
+Observed SHORT Liquidation USDT: ${liq.shortLiquidationUSDT}
+Observed Total Liquidation USDT: ${liq.totalLiquidationUSDT}
+LONG Share: ${liq.longSharePct}%
+SHORT Share: ${liq.shortSharePct}%
+Net Observed Pressure USDT (SHORT-LONG): ${liq.netObservedPressureUSDT}
 
-const expertPrompt = `You are a professional Binance Futures scalping analyst.
+IMPORTANT DATA SEMANTICS
+These are observed Binance force-order events collected while this page was monitoring the pair. They are NOT a forward-looking exchange liquidation heatmap and must not be treated as hidden future liquidation positions.
+
+OBSERVED LONG LIQUIDATION CLUSTERS
+${longClusters}
+
+OBSERVED SHORT LIQUIDATION CLUSTERS
+${shortClusters}
+
+ALL OBSERVED LIQUIDATION EVENTS IN THIS SNAPSHOT
+${events}`;
+}
+
+async function getLogSnapshot(log){
+  if(log?.marketSnapshot)return log.marketSnapshot; // future compatibility
+  if(log?.marketSnapshotId)return await getSnapshot(log.marketSnapshotId);
+  return null;
+}
+
+async function copyPromptToClipboard(text){
+  if(navigator.clipboard&&window.isSecureContext){await navigator.clipboard.writeText(text);return}
+  const ta=document.createElement("textarea");
+  ta.value=text;ta.setAttribute("readonly","");ta.style.position="fixed";ta.style.left="-9999px";ta.style.top="0";
+  document.body.appendChild(ta);ta.focus();ta.select();ta.setSelectionRange(0,ta.value.length);
+  const ok=document.execCommand("copy");document.body.removeChild(ta);
+  if(!ok)throw new Error("Clipboard access is blocked by the browser");
+}
+
+async function copyToGemini(symbol){
+  const r=records.find(x=>x.symbol===symbol);
+  if(!r?.logs?.length)return;
+  setStatus(`Building complete Gemini prompt for ${symbol}...`);
+  const log=r.logs[0],vm=log.viewModel||{};
+  const snapshot=await getLogSnapshot(log);
+  const candleText=formatCandlesForGemini(vm.candles||[]);
+  const orderBookText=formatOrderBookForGemini(snapshot?.orderBook);
+  const liquidationText=formatLiquidationsForGemini(snapshot?.liquidations);
+
+  const expertPrompt=`You are a professional Binance Futures scalping analyst.
 Analyze ONLY the supplied market data.
 
 RULES:
@@ -508,18 +1113,22 @@ RULES:
 - Analyze BUY and SELL independently, then select the stronger side.
 - Do not force a trade.
 - Never invent data or price levels. Use NOT_AVAILABLE when unsupported.
-- Derive dynamic support, resistance, breakout, breakdown, and rejection levels ONLY from the supplied 5m candle OHLCV data and other supplied market data.
+- Derive dynamic support, resistance, breakout, breakdown, rejection, squeeze pressure, entry, stop, and target levels ONLY from the supplied 5m candle OHLCV, SmartMoney, order-book, observed-liquidation, and other supplied market data.
 - Trigger levels must never be hard-coded or assumed from examples.
 - For volume-confirmed breakouts or breakdowns, use the supplied candle volumes to judge whether volume is sustained relative to recent candles.
+- Treat observed liquidation clusters as historical/real-time observed force-order evidence, NOT as a forward-looking liquidation heatmap.
+- Use order-book walls as current liquidity evidence, not guaranteed support/resistance.
 - Keep the final response compact and table-based.
 - Do not add explanations, long reasons, commentary, or extra sections.
 
 MARKET DATA
 Current Price: ${vm.current}
+24h Price Change: ${vm.priceChangePct}%
 24h Volume: ${vm.volume}
 Open Interest: ${vm.oiUSDT}
 Funding: ${vm.funding}%
-Timeframe: 30m
+SmartMoney Flow Window: 30m
+OHLCV Candle Interval: 5m
 
 TRADERS
 Total Position Value: ${vm.totalTradersPos}
@@ -535,16 +1144,22 @@ SHORT Whales: ${vm.shortWhales} | Value: ${vm.shortWhalesPos}
 Avg LONG Entry: ${vm.longWhaleEntry} | Avg SHORT Entry: ${vm.shortWhaleEntry}
 Profitable LONG: ${vm.longWhaleProfitPct} | Profitable SHORT: ${vm.shortWhaleProfitPct}
 
-30M FLOW
+30M SMARTMONEY FLOW
 Trader Delta: ${vm.l30Traders}
 Whale Delta: ${vm.l30Whales}
 Position Delta: ${vm.l30Pos}
 Whale Quantity Delta: ${vm.l30Qty}
 
+REAL-TIME ORDER BOOK SNAPSHOT
+${orderBookText}
+
+OBSERVED LIQUIDATION DATA
+${liquidationText}
+
 5M CANDLES (OHLCV)
-Loaded: ${vm.candleMeta?.loaded ?? 0} / Requested: ${vm.candleMeta?.requested ?? 100}
-Valid: ${vm.candleMeta?.valid ?? 0}
-Candle data status: ${vm.candleMeta?.loadedOk ? "VALID" : "NOT_FULLY_VALID"}
+Loaded: ${vm.candleMeta?.loaded??0} / Requested: ${vm.candleMeta?.requested??100}
+Valid: ${vm.candleMeta?.valid??0}
+Candle data status: ${vm.candleMeta?.loadedOk?"VALID":"NOT_FULLY_VALID"}
 ${candleText}
 
 EXACT OUTPUT
@@ -578,35 +1193,39 @@ OUTPUT RULES:
 - No reasons/explanations.
 - No asset identity.`;
 
-copyPromptToClipboard(expertPrompt).then(() => {
-  const candleCount = (vm.candles || []).length;
-  setStatus(`SAMER Crypto prompt copied: ${candleCount} candles • ${expertPrompt.length.toLocaleString()} chars. Paste this exact prompt into Gemini.`,"ok");
-}).catch(err => {
-  console.error("Gemini clipboard error:", err);
-  setStatus(`COPY FAILED: ${err.message}. Use Ctrl+C from the prompt fallback.`,"err");
-});
+  try{
+    await copyPromptToClipboard(expertPrompt);
+    const obStatus=snapshot?.orderBook?.status||"NOT_AVAILABLE";
+    const liqStatus=snapshot?.liquidations?.status||"NOT_AVAILABLE";
+    setStatus(`SAMER Crypto prompt copied COMPLETE: ${(vm.candles||[]).length} candles • ORDER BOOK ${obStatus} • LIQ ${liqStatus} • ${expertPrompt.length.toLocaleString()} chars.`,"ok");
+  }catch(err){console.error(err);setStatus(`COPY FAILED: ${err.message}`,"err")}
 }
 
-function copyToGeminiCompare(symbol){
-const r=records.find(x=>x.symbol===symbol);
-if(!r || !r.logs || r.logs.length < 2)return;
+async function copyToGeminiCompare(symbol){
+  const r=records.find(x=>x.symbol===symbol);
+  if(!r?.logs||r.logs.length<2)return;
+  setStatus(`Loading all saved microstructure snapshots for ${symbol} comparison...`);
+  const logs=[...r.logs].sort((a,b)=>a.fetchedAt-b.fetchedAt);
+  const totalLogs=logs.length;
+  const snapshots=await Promise.all(logs.map(getLogSnapshot));
 
-const logs = [...r.logs].sort((a,b)=>a.fetchedAt-b.fetchedAt);
-const totalLogs = logs.length;
-const logBlocks = logs.map((log, i)=>{
-  const vm = log.viewModel || {};
-  const ts = new Date(log.fetchedAt).toISOString();
-  const candleText = formatCandlesForGemini(vm.candles || []);
-  const cm = vm.candleMeta || {};
-  const latestCandle = Array.isArray(vm.candles) && vm.candles.length ? vm.candles[vm.candles.length - 1] : null;
-  const candleSummary = latestCandle ? `Latest candle: ${new Date(latestCandle.time).toISOString()} | O ${latestCandle.open} | H ${latestCandle.high} | L ${latestCandle.low} | C ${latestCandle.close} | V ${latestCandle.volume}` : "Latest candle: NOT_AVAILABLE";
-  return `LOG ${i+1}/${totalLogs}
+  const logBlocks=logs.map((log,i)=>{
+    const vm=log.viewModel||{};
+    const ts=new Date(log.fetchedAt).toISOString();
+    const cm=vm.candleMeta||{};
+    const candleText=formatCandlesForGemini(vm.candles||[]);
+    const snapshot=snapshots[i];
+    const orderBookText=formatOrderBookForGemini(snapshot?.orderBook);
+    const liquidationText=formatLiquidationsForGemini(snapshot?.liquidations);
+    return`LOG ${i+1}/${totalLogs}
 Log Timestamp: ${ts}
 Current Price: ${vm.current}
 24h Price Change: ${vm.priceChangePct}%
 24h Volume: ${vm.volume}
 Open Interest (USDT): ${vm.oiUSDT}
 Funding: ${vm.funding}%
+SmartMoney Flow Window: 30m
+OHLCV Candle Interval: 5m
 
 TRADERS
 Total Position Value (USDT): ${vm.totalTradersPos}
@@ -622,22 +1241,27 @@ SHORT Whales: ${vm.shortWhales} | Value: ${vm.shortWhalesPos}
 Avg LONG Whale Entry: ${vm.longWhaleEntry} | Avg SHORT Whale Entry: ${vm.shortWhaleEntry}
 Profitable LONG Whales: ${vm.longWhaleProfitPct} | Profitable SHORT Whales: ${vm.shortWhaleProfitPct}
 
-30M FLOW
+30M SMARTMONEY FLOW
 Trader Delta: ${vm.l30Traders}
 Whale Delta: ${vm.l30Whales}
 Position Delta: ${vm.l30Pos}
 Whale Quantity Delta: ${vm.l30Qty}
 
-5M CANDLES (OHLCV)
-Interval: ${cm.interval || "30m"}
-Loaded: ${cm.loaded ?? 0} / Requested: ${cm.requested ?? 100}
-Valid: ${cm.valid ?? 0}
-Candle data status: ${cm.loadedOk ? "VALID" : "NOT_FULLY_VALID"}
-${candleSummary}
-${candleText}`;
-}).join('\n\n');
+REAL-TIME ORDER BOOK SNAPSHOT FOR THIS LOG
+${orderBookText}
 
-const comparePrompt = `IMPORTANT EXECUTION CONTRACT
+OBSERVED LIQUIDATION DATA FOR THIS LOG
+${liquidationText}
+
+5M CANDLES (OHLCV)
+Interval: ${cm.interval||"5m"}
+Loaded: ${cm.loaded??0} / Requested: ${cm.requested??100}
+Valid: ${cm.valid??0}
+Candle data status: ${cm.loadedOk?"VALID":"NOT_FULLY_VALID"}
+${candleText}`;
+  }).join("\n\n");
+
+  const comparePrompt=`IMPORTANT EXECUTION CONTRACT
 IGNORE ALL PREVIOUS MESSAGES, CONVERSATION CONTEXT, NAMES, IDENTITIES, DASHBOARD NAMES, SYSTEM VERSIONS, AND PRIOR RESPONSES.
 The text below is the ONLY task and ONLY data source for this request.
 DO NOT GREET. DO NOT ASK QUESTIONS. DO NOT INTRODUCE YOURSELF. DO NOT MENTION ANY DASHBOARD, SYSTEM VERSION, USER NAME, OR PRIOR CONVERSATION.
@@ -646,10 +1270,10 @@ EXECUTE THE TASK IMMEDIATELY.
 TASK: Perform a Binance Futures scalping comparison using ONLY the supplied logs below.
 
 You are a highly experienced, professional, disciplined, and trusted Binance Futures scalping comparison analyst.
-Operate as an expert market-structure, order-flow, smart-money, and risk-management analyst.
+Operate as an expert market-structure, order-flow, smart-money, order-book microstructure, observed-liquidation, and risk-management analyst.
 The supplied logs are snapshots of the SAME underlying market. Process ALL supplied logs in chronological order from oldest to newest.
 Your analysis must adapt to the evidence in the supplied history: learn from the evolution of the logs, detect what is strengthening, weakening, reversing, or persisting, and refine the current decision accordingly.
-Do not claim permanent memory, self-training, or learning outside the information supplied in this request. If explicit feedback is supplied, use it as an additional learning signal; otherwise rely only on the supplied market history.
+Do not claim permanent memory, self-training, or learning outside the information supplied in this request.
 
 DATA COMPLETENESS CONTRACT
 - TOTAL LOGS SUPPLIED: ${totalLogs}
@@ -657,6 +1281,7 @@ DATA COMPLETENESS CONTRACT
 - LOG 1/${totalLogs} through LOG ${totalLogs}/${totalLogs} are mandatory input records when present.
 - Do NOT omit, merge, reorder, or fabricate any log.
 - Use intermediate logs to detect evolution, acceleration, reversal, persistence, and confirmation changes.
+- Use every supplied captured order-book level and every supplied observed liquidation event; do not silently discard supplied microstructure data.
 
 RULES:
 - Output title must be exactly: SAMER Crypto
@@ -668,17 +1293,18 @@ RULES:
 - Analyze BUY and SELL independently, then select the stronger side only when supported.
 - Do not force a trade.
 - Use ALL supplied logs; give more weight to the latest confirmed state while using the full history for context.
-- Never invent data, prices, levels, candle values, volume values, or missing fields. Use NOT_AVAILABLE when unsupported.
-- Derive dynamic support, resistance, breakout, breakdown, rejection, entry, stop, and target levels ONLY from supplied 5m OHLCV candles and supplied market data.
+- Never invent data, prices, levels, candle values, volume values, order-book levels, liquidation events, or missing fields. Use NOT_AVAILABLE when unsupported.
+- Derive dynamic support, resistance, breakout, breakdown, rejection, squeeze pressure, entry, stop, and target levels ONLY from supplied 5m OHLCV, SmartMoney, order-book, observed-liquidation, and supplied market data.
+- Treat observed liquidation clusters as observed force-order history during monitoring, NOT as a forward-looking liquidation heatmap.
+- Order-book walls are live liquidity evidence and can be pulled/cancelled; never treat them as guaranteed levels.
 - Trigger levels must never be hard-coded or assumed from examples.
 - For breakout/breakdown confirmation, compare recent candle volume with nearby recent candle volume context.
 - If the latest candle may still be forming, treat it as provisional and prefer the latest completed candle for confirmation.
 - Distinguish confirmed setup vs potential setup vs WAIT/NO_TRADE.
 - Compare the full log sequence before producing the final decision.
-- Learn within this request from the chronological behavior of the supplied logs: identify persistent signals, failed signals, reversals, acceleration, deceleration, and confirmation changes.
-- Do not ignore contradictory evidence; explicitly downgrade confidence when price structure, volume, flow, OI, funding, traders, or whales disagree.
+- Do not ignore contradictory evidence; explicitly downgrade confidence when price structure, volume, flow, OI, funding, traders, whales, order book, or liquidations disagree.
 - Before finalizing the signal, identify the single most important confirmation that would strengthen the chosen direction and the single most important condition that would invalidate it.
-- If any information is necessary for a safer or more accurate decision but is not available in the supplied data, mention it only in the final Professional Notes table.
+- If information necessary for a safer or more accurate decision is unavailable, mention it only in the final Professional Notes table.
 - Keep the final response compact, clear, and table-based.
 
 SUPPLIED LOGS
@@ -728,7 +1354,6 @@ OUTPUT RULES:
 - Return exactly the title and the three tables above, in this order.
 - The Professional Notes table MUST be last.
 - Put only necessary information, warnings, feedback, or recommendations in the Professional Notes table.
-- Do not add any information to the main signal tables just because it is interesting; preserve the requested table structure.
 - No Evolution table.
 - No bullet lists.
 - No prose paragraphs.
@@ -738,66 +1363,56 @@ OUTPUT RULES:
 - No extra text before or after the three tables.
 - No asset identity.`;
 
-const copyText = async text => {
-  if (navigator.clipboard && window.isSecureContext) {
-    await navigator.clipboard.writeText(text);
-    return;
-  }
-  const ta=document.createElement("textarea");
-  ta.value=text;
-  ta.style.position="fixed";
-  ta.style.opacity="0";
-  document.body.appendChild(ta);
-  ta.focus();
-  ta.select();
-  const ok=document.execCommand("copy");
-  ta.remove();
-  if(!ok) throw new Error("Clipboard copy failed");
-};
-
-copyText(comparePrompt).then(() => {
-  const candleCount = logs.reduce((sum,log)=>sum+(log.viewModel?.candles?.length||0),0);
-  setStatus(`COMPARE ready: ${totalLogs} logs • ${candleCount} candles • all logs included.` ,"ok");
-}).catch(err=>{
-  console.error("COMPARE copy error:",err);
-  setStatus(`COMPARE copy failed: ${err.message}`,"err");
-});
+  try{
+    await copyPromptToClipboard(comparePrompt);
+    const snapshotCount=snapshots.filter(Boolean).length;
+    const candleCount=logs.reduce((sum,log)=>sum+(log.viewModel?.candles?.length||0),0);
+    setStatus(`COMPARE copied COMPLETE: ${totalLogs} logs • ${snapshotCount}/${totalLogs} microstructure snapshots • ${candleCount} candles • ${comparePrompt.length.toLocaleString()} chars.`,snapshotCount===totalLogs?"ok":"err");
+  }catch(err){console.error(err);setStatus(`COMPARE copy failed: ${err.message}`,"err")}
 }
-setInterval(() => {
-  const now = Math.floor(Date.now() / 1000);
-  records.forEach(r => {
-    const interval = r.intervalSec || DEFAULT_INTERVAL;
-    if (!r.nextFetchTime) r.nextFetchTime = now + interval;
 
-    if (!r.fetchedDone && now >= r.nextFetchTime) {
-      r.fetchedDone = true;
-      fetchData(r.symbol).then(data => {
-        const vm = model(data);
-        r.logs.unshift({viewModel: vm, fetchedAt: Date.now()});
-        r.nextFetchTime = Math.floor(Date.now() / 1000) + (r.intervalSec || DEFAULT_INTERVAL);
-        r.fetchedDone = false;
-        save();
-        render();
-      }).catch(err => {
-        console.error("Auto fetch error for", r.symbol, err);
-        r.fetchedDone = false;
-        r.nextFetchTime = Math.floor(Date.now() / 1000) + 15;
-      });
-    } else if (!r.fetchedDone) {
-      const badge = document.getElementById(`timer-${r.symbol}`);
-      if (badge) {
-        const timeLeft = Math.max(0, r.nextFetchTime - now);
-        const mins = String(Math.floor(timeLeft / 60)).padStart(2, '0');
-        const secs = String(timeLeft % 60).padStart(2, '0');
-        badge.textContent = `⏱ ${mins}:${secs}`;
+/* ------------------------------- TIMERS --------------------------------- */
+setInterval(()=>{
+  const now=Math.floor(Date.now()/1000);
+  records.forEach(r=>{
+    const interval=r.intervalSec||DEFAULT_INTERVAL;
+    if(!r.nextFetchTime)r.nextFetchTime=now+interval;
+    if(!r.fetchedDone&&now>=r.nextFetchTime){
+      r.fetchedDone=true;
+      fetchData(r.symbol)
+        .then(data=>buildLogEntry(r.symbol,data))
+        .then(logEntry=>{
+          r.logs.unshift(logEntry);
+          r.nextFetchTime=Math.floor(Date.now()/1000)+(r.intervalSec||DEFAULT_INTERVAL);
+          r.fetchedDone=false;
+          save();render();
+        })
+        .catch(err=>{
+          console.error("Auto fetch error for",r.symbol,err);
+          r.fetchedDone=false;
+          r.nextFetchTime=Math.floor(Date.now()/1000)+15;
+        });
+    }else if(!r.fetchedDone){
+      const badge=document.getElementById(`timer-${r.symbol}`);
+      if(badge){
+        const timeLeft=Math.max(0,r.nextFetchTime-now);
+        badge.textContent=`⏱ ${String(Math.floor(timeLeft/60)).padStart(2,"0")}:${String(timeLeft%60).padStart(2,"0")}`;
       }
     }
   });
-}, 1000);
+},1000);
+
+setInterval(updateFeedBadges,1000);
 
 search.addEventListener("click",searchCoin);
 coin.addEventListener("keydown",e=>{if(e.key==="Enter")searchCoin()});
+window.addEventListener("beforeunload",()=>{for(const symbol of marketHubs.keys())stopMarketStream(symbol)});
+
+// Restore live streams for previously saved pairs without changing their logs.
+records.forEach(r=>ensureMarketStream(r.symbol));
+openMarketDB().catch(e=>console.warn("IndexedDB unavailable",e));
 render();
 </script>
+
 </body>
 </html>
